@@ -15,17 +15,23 @@ type Memory = VirtualMemory<DefaultMemoryImpl>;
 type IdCell = Cell<u64, Memory>;
 
 #[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
-struct Message {
+struct Warehouse {
     id: u64,
-    title: String,
-    body: String,
-    attachment_url: String,
+    name: String,
+    created_at: u64,
+}
+
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
+struct StockItem {
+    item_id: u64,
+    warehouse_id: u64,
+    item_name: String,
+    quantity: u64,
     created_at: u64,
     updated_at: Option<u64>,
 }
 
-// a trait that must be implemented for a struct that is stored in a stable struct
-impl Storable for Message {
+impl Storable for Warehouse {
     fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
         Cow::Owned(Encode!(self).unwrap())
     }
@@ -35,8 +41,22 @@ impl Storable for Message {
     }
 }
 
-// another trait that must be implemented for a struct that is stored in a stable struct
-impl BoundedStorable for Message {
+impl BoundedStorable for Warehouse {
+    const MAX_SIZE: u32 = 1024;
+    const IS_FIXED_SIZE: bool = false;
+}
+
+impl Storable for StockItem {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+}
+
+impl BoundedStorable for StockItem {
     const MAX_SIZE: u32 = 1024;
     const IS_FIXED_SIZE: bool = false;
 }
@@ -46,100 +66,169 @@ thread_local! {
         MemoryManager::init(DefaultMemoryImpl::default())
     );
 
-    static ID_COUNTER: RefCell<IdCell> = RefCell::new(
+    static WAREHOUSE_ID_COUNTER: RefCell<IdCell> = RefCell::new(
         IdCell::init(MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))), 0)
-            .expect("Cannot create a counter")
+            .expect("Cannot create warehouse id counter")
     );
 
-    static STORAGE: RefCell<StableBTreeMap<u64, Message, Memory>> =
+    static ITEM_ID_COUNTER: RefCell<IdCell> = RefCell::new(
+        IdCell::init(MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1))), 0)
+            .expect("Cannot create item id counter")
+    );
+
+    static WAREHOUSE_STORAGE: RefCell<StableBTreeMap<u64, Warehouse, Memory>> =
         RefCell::new(StableBTreeMap::init(
-            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1)))
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(2)))
+    ));
+
+    static STOCK_STORAGE: RefCell<StableBTreeMap<u64, StockItem, Memory>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(3)))
     ));
 }
 
 #[derive(candid::CandidType, Serialize, Deserialize, Default)]
-struct MessagePayload {
-    title: String,
-    body: String,
-    attachment_url: String,
+struct WarehousePayload {
+    name: String,
+}
+
+#[derive(candid::CandidType, Serialize, Deserialize, Default)]
+struct StockItemPayload {
+    warehouse_id: u64,
+    item_name: String,
+    quantity: u64,
 }
 
 #[ic_cdk::query]
-fn get_message(id: u64) -> Result<Message, Error> {
-    match _get_message(&id) {
-        Some(message) => Ok(message),
+fn get_warehouse(id: u64) -> Result<Warehouse, Error> {
+    match _get_warehouse(&id) {
+        Some(warehouse) => Ok(warehouse),
         None => Err(Error::NotFound {
-            msg: format!("a message with id={} not found", id),
+            msg: format!("A warehouse with id={} not found", id),
         }),
     }
 }
 
 #[ic_cdk::update]
-fn add_message(message: MessagePayload) -> Option<Message> {
-    let id = ID_COUNTER
+fn add_warehouse(payload: WarehousePayload) -> Result<Warehouse, Error> {
+    let id = WAREHOUSE_ID_COUNTER
         .with(|counter| {
             let current_value = *counter.borrow().get();
             counter.borrow_mut().set(current_value + 1)
         })
-        .expect("cannot increment id counter");
-    let message = Message {
+        .expect("cannot increment warehouse id counter");
+
+    let warehouse = Warehouse {
         id,
-        title: message.title,
-        body: message.body,
-        attachment_url: message.attachment_url,
+        name: payload.name,
         created_at: time(),
-        updated_at: None,
     };
-    do_insert(&message);
-    Some(message)
+
+    WAREHOUSE_STORAGE.with(|storage| storage.borrow_mut().insert(id, warehouse.clone()));
+
+    Ok(warehouse)
 }
 
 #[ic_cdk::update]
-fn update_message(id: u64, payload: MessagePayload) -> Result<Message, Error> {
-    match STORAGE.with(|service| service.borrow().get(&id)) {
-        Some(mut message) => {
-            message.attachment_url = payload.attachment_url;
-            message.body = payload.body;
-            message.title = payload.title;
-            message.updated_at = Some(time());
-            do_insert(&message);
-            Ok(message)
+fn add_item_to_warehouse(payload: StockItemPayload) -> Result<StockItem, Error> {
+    match WAREHOUSE_STORAGE.with(|storage| storage.borrow().get(&payload.warehouse_id)) {
+        Some(_) => {
+            let item_id = ITEM_ID_COUNTER
+                .with(|counter| {
+                    let current_value = *counter.borrow().get();
+                    counter.borrow_mut().set(current_value + 1)
+                })
+                .expect("cannot increment item id counter");
+
+            let item = StockItem {
+                item_id,
+                warehouse_id: payload.warehouse_id,
+                item_name: payload.item_name,
+                quantity: payload.quantity,
+                created_at: time(),
+                updated_at: None,
+            };
+
+            STOCK_STORAGE.with(|storage| storage.borrow_mut().insert(item_id, item.clone()));
+            Ok(item)
         }
         None => Err(Error::NotFound {
-            msg: format!(
-                "couldn't update a message with id={}. message not found",
-                id
-            ),
+            msg: format!("Warehouse with id={} not found", payload.warehouse_id),
         }),
     }
 }
 
-// helper method to perform insert.
-fn do_insert(message: &Message) {
-    STORAGE.with(|service| service.borrow_mut().insert(message.id, message.clone()));
+#[ic_cdk::query]
+fn check_stock(item_id: u64) -> Result<StockItem, Error> {
+    match STOCK_STORAGE.with(|storage| storage.borrow().get(&item_id)) {
+        Some(stock_item) => Ok(stock_item),
+        None => Err(Error::NotFound {
+            msg: format!("Item with id={} not found", item_id),
+        }),
+    }
 }
 
 #[ic_cdk::update]
-fn delete_message(id: u64) -> Result<Message, Error> {
-    match STORAGE.with(|service| service.borrow_mut().remove(&id)) {
-        Some(message) => Ok(message),
-        None => Err(Error::NotFound {
-            msg: format!(
-                "couldn't delete a message with id={}. message not found.",
-                id
-            ),
-        }),
-    }
+fn transfer_item(item_id: u64, to_warehouse_id: u64, quantity: u64) -> Result<(), Error> {
+    STOCK_STORAGE.with(|storage| {
+        if let Some(mut item) = storage.borrow_mut().get_mut(&item_id) {
+            if item.quantity < quantity {
+                return Err(Error::NotEnoughStock {
+                    msg: format!(
+                        "Not enough stock for item_id={}, available={}, requested={}",
+                        item_id, item.quantity, quantity
+                    ),
+                });
+            }
+
+            item.quantity -= quantity;
+            item.updated_at = Some(time());
+
+            let new_item = StockItem {
+                item_id: ITEM_ID_COUNTER.with(|counter| *counter.borrow().get()),
+                warehouse_id: to_warehouse_id,
+                item_name: item.item_name.clone(),
+                quantity,
+                created_at: time(),
+                updated_at: None,
+            };
+
+            STOCK_STORAGE.with(|s| s.borrow_mut().insert(new_item.item_id, new_item));
+            Ok(())
+        } else {
+            Err(Error::NotFound {
+                msg: format!("Item with id={} not found", item_id),
+            })
+        }
+    })
+}
+
+#[ic_cdk::query]
+fn get_warehouse_stock(warehouse_id: u64) -> Vec<StockItem> {
+    STOCK_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .iter()
+            .filter_map(|(_, item)| {
+                if item.warehouse_id == warehouse_id {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
 }
 
 #[derive(candid::CandidType, Deserialize, Serialize)]
 enum Error {
     NotFound { msg: String },
+    NotEnoughStock { msg: String },
 }
 
-// a helper method to get a message by id. used in get_message/update_message
-fn _get_message(id: &u64) -> Option<Message> {
-    STORAGE.with(|service| service.borrow().get(id))
+// helper functions
+fn _get_warehouse(id: &u64) -> Option<Warehouse> {
+    WAREHOUSE_STORAGE.with(|service| service.borrow().get(id))
 }
 
 // need this to generate candid
