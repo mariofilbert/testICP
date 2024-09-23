@@ -1,22 +1,35 @@
-type Error = variant { NotFound : record { msg : text } };
-type Message = record {
-  id : nat64;
-  title : text;
+type Error = variant {
+  NotFound : record { msg : text };
+  NotEnoughStock : record { msg : text };
+};
+type Result = variant { Ok : StockItem; Err : Error };
+type Result_1 = variant { Ok : Warehouse; Err : Error };
+type Result_2 = variant { Ok; Err : Error };
+type StockItem = record {
   updated_at : opt nat64;
-  body : text;
+  item_name : text;
   created_at : nat64;
-  attachment_url : text;
+  quantity : nat64;
+  warehouse_id : nat64;
+  item_id : nat64;
 };
-type MessagePayload = record {
-  title : text;
-  body : text;
-  attachment_url : text;
+type StockItemPayload = record {
+  item_name : text;
+  quantity : nat64;
+  warehouse_id : nat64;
 };
-type Result = variant { Ok : Message; Err : Error };
+type Warehouse = record { id : nat64; name : text; created_at : nat64 };
+type WarehousePayload = record { name : text };
 service : {
-  add_message : (MessagePayload) -> (opt Message);
-  delete_message : (nat64) -> (Result);
-  get_message : (nat64) -> (Result) query;
-  greet : (text) -> (text) query;
-  update_message : (nat64, MessagePayload) -> (Result);
+  add_item_to_warehouse : (StockItemPayload) -> (Result);
+  add_warehouse : (WarehousePayload) -> (Result_1);
+  check_stock : (nat64) -> (Result) query;
+  delete_item : (nat64) -> (Result);
+  delete_warehouse : (nat64) -> (Result_1);
+  get_all_warehouses_with_stocks : () -> (
+      vec record { Warehouse; vec StockItem },
+    ) query;
+  get_warehouse : (nat64) -> (Result_1) query;
+  get_warehouse_stock : (nat64) -> (vec StockItem) query;
+  transfer_item : (nat64, nat64, nat64, nat64) -> (Result_2);
 }
