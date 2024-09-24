@@ -179,6 +179,12 @@ fn delete_warehouse(warehouse_id: u64) -> Result<(), Error> {
         });
     }
 
+    // Add the deleted ID to the HashSet for reuse
+    WAREHOUSE_ID_COUNTER.with(|counter| {
+        let mut counter_mut = counter.borrow_mut();
+        counter_mut.insert(warehouse_id);
+    });
+
     // Step 2: Now delete all stock items associated with the warehouse
     STOCK_STORAGE.with(|storage| {
         let mut stock_storage = storage.borrow_mut(); // Get mutable borrow
@@ -197,6 +203,7 @@ fn delete_warehouse(warehouse_id: u64) -> Result<(), Error> {
 
     Ok(())
 }
+
 
 #[ic_cdk::query]
 fn get_all_warehouses_with_stocks() -> Vec<(Warehouse, Vec<StockItem>)> {
