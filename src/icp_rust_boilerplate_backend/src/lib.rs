@@ -90,17 +90,6 @@ struct StockItemPayload {
     quantity: u64,
 }
 
-// // Function to get the next available ID
-// fn get_next_available_id(counter: &mut Vec<u64>) -> u64 {
-//     if let Some(id) = counter.pop() {
-//         id
-//     } else {
-//         // If no IDs are available, return the next highest ID
-//         let next_id = counter.len() as u64;
-//         next_id
-//     }
-// }
-
 // Function to get the next available warehouse ID
 fn get_next_warehouse_id() -> u64 {
     // First, try to find the smallest reusable ID
@@ -177,29 +166,37 @@ fn add_warehouse(payload: WarehousePayload) -> Result<Warehouse, Error> {
 }
 
 #[ic_cdk::update]
-fn delete_warehouse(warehouse_id: u64) -> Result<Warehouse, Error> {
-    // Attempt to remove the warehouse, minimizing the mutable borrow
-    let warehouse = WAREHOUSE_STORAGE.with(|warehouse_storage| {
-        // Create a mutable borrow
-        let mut storage = warehouse_storage.borrow_mut();
-        storage.remove(&warehouse_id) // Attempt to remove the warehouse
+fn delete_warehouse(warehouse_id: u64) -> Result<(), Error> {
+    // Step 1: Remove the warehouse and check if it was found
+    let warehouse_found = WAREHOUSE_STORAGE.with(|storage| {
+        let mut storage_mut = storage.borrow_mut(); // Get mutable borrow
+        storage_mut.remove(&warehouse_id).is_some() // Remove and check if it existed
     });
 
-    // If a warehouse was found and removed, add its ID back to the reusable set
-    if let Some(warehouse) = warehouse {
-        // Borrow the ID counter and add the warehouse ID back
-        WAREHOUSE_ID_COUNTER.with(|counter| {
-            let mut counter_mut = counter.borrow_mut(); // Mutable borrow
-            counter_mut.insert(warehouse.id); // Add the deleted ID back
-        });
-        return Ok(warehouse);
-    } else {
+    if !warehouse_found {
         return Err(Error::NotFound {
             msg: format!("Warehouse with id={} not found", warehouse_id),
         });
     }
-}
 
+    // Step 2: Now delete all stock items associated with the warehouse
+    STOCK_STORAGE.with(|storage| {
+        let mut stock_storage = storage.borrow_mut(); // Get mutable borrow
+
+        // Collect stock item IDs to remove
+        let item_ids_to_remove: Vec<u64> = stock_storage.iter()
+            .filter(|(_, item)| item.warehouse_id == warehouse_id)
+            .map(|(id, _)| id)
+            .collect();
+
+        // Remove the stock items
+        for item_id in item_ids_to_remove {
+            stock_storage.remove(&item_id);
+        }
+    });
+
+    Ok(())
+}
 
 #[ic_cdk::query]
 fn get_all_warehouses_with_stocks() -> Vec<(Warehouse, Vec<StockItem>)> {
@@ -240,22 +237,46 @@ fn add_item_to_warehouse(payload: StockItemPayload) -> Result<StockItem, Error> 
         });
     }
 
-    // Get the next available item ID
-    let item_id = get_next_item_id(); // Avoid nesting mutable borrows
+    // Check if an item with the same name already exists in the warehouse
+    let existing_item_id = STOCK_STORAGE.with(|storage| {
+        storage.borrow().iter()
+            .find(|(_, item)| item.warehouse_id == payload.warehouse_id && item.item_name == payload.item_name)
+            .map(|(id, _)| id) // Return the existing item ID
+    });
 
-    let item = StockItem {
-        item_id,
-        warehouse_id: payload.warehouse_id,
-        item_name: payload.item_name,
-        quantity: payload.quantity,
-        created_at: time(),
-        updated_at: None,
+    let item = if let Some(item_id) = existing_item_id {
+        // If the item exists, update the quantity
+        STOCK_STORAGE.with(|storage| {
+            let mut stock_storage = storage.borrow_mut();
+            if let Some(existing_item) = stock_storage.get(&item_id) {
+                let mut existing_item = existing_item.clone(); // Clone to modify
+                existing_item.quantity += payload.quantity; // Increment the quantity
+                existing_item.updated_at = Some(time()); // Update the timestamp
+                stock_storage.insert(item_id, existing_item.clone()); // Reinsert updated item
+                return Ok(existing_item); // Return the updated item wrapped in Ok
+            } else {
+                return Err(Error::NotFound {
+                    msg: format!("Item with id={} not found", item_id),
+                });
+            }
+        })?
+    } else {
+        // If no existing item, create a new one
+        let item_id = get_next_item_id();
+        StockItem {
+            item_id,
+            warehouse_id: payload.warehouse_id,
+            item_name: payload.item_name,
+            quantity: payload.quantity,
+            created_at: time(),
+            updated_at: None,
+        }
     };
 
-    // Insert the new item outside of a nested borrow
+    // Insert the new or updated item into storage
     STOCK_STORAGE.with(|storage| {
         let mut stock_storage = storage.borrow_mut();
-        stock_storage.insert(item_id, item.clone());
+        stock_storage.insert(item.item_id, item.clone());
     });
 
     Ok(item)
@@ -273,13 +294,38 @@ fn check_stock(item_id: u64) -> Result<StockItem, Error> {
 }
 
 #[ic_cdk::update]
-fn delete_item(item_id: u64) -> Result<StockItem, Error> {
+fn delete_item(item_id: u64, quantity: u64) -> Result<StockItem, Error> {
     STOCK_STORAGE.with(|storage| {
+        // Borrow the storage as mutable
         let mut stock = storage.borrow_mut();
         
-        if let Some(item) = stock.remove(&item_id) {
-            ITEM_ID_COUNTER.with(|counter| counter.borrow_mut().push(item_id)); // Reuse the ID
-            Ok(item)
+        // Check if the item exists
+        if let Some(item) = stock.get(&item_id) {
+            let mut item = item.clone(); // Clone to modify
+
+            // Check if the quantity to delete is valid
+            if quantity > item.quantity {
+                return Err(Error::NotEnoughStock {
+                    msg: format!(
+                        "Not enough stock to delete: available={}, requested={}",
+                        item.quantity, quantity
+                    ),
+                });
+            }
+
+            // Decrement the quantity
+            item.quantity -= quantity;
+            item.updated_at = Some(time()); // Update the timestamp
+            
+            // If quantity is zero, remove the item
+            if item.quantity == 0 {
+                stock.remove(&item_id);
+            } else {
+                // If there are remaining items, update the stock
+                stock.insert(item_id, item.clone()); // Reinsert the updated item
+            }
+            
+            Ok(item) // Return the updated item
         } else {
             Err(Error::NotFound {
                 msg: format!("Item with id={} not found", item_id),
@@ -287,7 +333,6 @@ fn delete_item(item_id: u64) -> Result<StockItem, Error> {
         }
     })
 }
-
 
 // Function to transfer items between warehouses
 #[ic_cdk::update]

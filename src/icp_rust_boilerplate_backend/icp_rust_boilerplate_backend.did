@@ -24,8 +24,8 @@ service : {
   add_item_to_warehouse : (StockItemPayload) -> (Result);
   add_warehouse : (WarehousePayload) -> (Result_1);
   check_stock : (nat64) -> (Result) query;
-  delete_item : (nat64) -> (Result);
-  delete_warehouse : (nat64) -> (Result_1);
+  delete_item : (nat64, nat64) -> (Result);
+  delete_warehouse : (nat64) -> (Result_2);
   get_all_warehouses_with_stocks : () -> (
       vec record { Warehouse; vec StockItem },
     ) query;
