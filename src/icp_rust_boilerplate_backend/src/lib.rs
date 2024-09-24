@@ -5,6 +5,7 @@ use ic_cdk::api::time;
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::{borrow::Cow, cell::RefCell};
+use std::collections::HashSet; // Import HashSet
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
 
@@ -60,8 +61,11 @@ thread_local! {
         MemoryManager::init(DefaultMemoryImpl::default())
     );
 
-    static WAREHOUSE_ID_COUNTER: RefCell<Vec<u64>> = RefCell::new(Vec::new());
-    static ITEM_ID_COUNTER: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    static WAREHOUSE_ID_COUNTER: RefCell<HashSet<u64>> = RefCell::new(HashSet::new()); // Store deleted IDs
+    static WAREHOUSE_ID_INCREMENT: RefCell<u64> = RefCell::new(1);  // Store current counter for new IDs
+
+    static ITEM_ID_COUNTER: RefCell<Vec<u64>> = RefCell::new(Vec::new()); // Store reusable IDs
+    static ITEM_ID_INCREMENT: RefCell<u64> = RefCell::new(1);  // Store current counter for new IDs
 
     static WAREHOUSE_STORAGE: RefCell<StableBTreeMap<u64, Warehouse, Memory>> =
         RefCell::new(StableBTreeMap::init(
@@ -86,17 +90,64 @@ struct StockItemPayload {
     quantity: u64,
 }
 
-// Function to get the next available ID
-fn get_next_available_id(counter: &mut Vec<u64>) -> u64 {
-    if let Some(id) = counter.pop() {
-        id
-    } else {
-        // If no IDs are available, return the next highest ID
-        let next_id = counter.len() as u64;
-        next_id
+// // Function to get the next available ID
+// fn get_next_available_id(counter: &mut Vec<u64>) -> u64 {
+//     if let Some(id) = counter.pop() {
+//         id
+//     } else {
+//         // If no IDs are available, return the next highest ID
+//         let next_id = counter.len() as u64;
+//         next_id
+//     }
+// }
+
+// Function to get the next available warehouse ID
+fn get_next_warehouse_id() -> u64 {
+    // First, try to find the smallest reusable ID
+    let reusable_id = WAREHOUSE_ID_COUNTER.with(|counter| {
+        let counter_ref = counter.borrow(); // Immutable borrow
+        counter_ref.iter().min().copied() // Get the smallest available ID
+    });
+
+    // If a reusable ID exists, remove it from the set and return it
+    if let Some(id) = reusable_id {
+        WAREHOUSE_ID_COUNTER.with(|counter| {
+            let mut counter_mut = counter.borrow_mut(); // Mutable borrow
+            counter_mut.remove(&id); // Remove the reused ID
+        });
+        return id; // Return the reusable ID
     }
+
+    // If no reusable ID exists, increment the main counter
+    WAREHOUSE_ID_INCREMENT.with(|counter| {
+        let mut id_counter = counter.borrow_mut(); // Mutable borrow
+        let next_id = *id_counter; // Get the current ID
+        *id_counter += 1; // Increment for next use
+        next_id // Return the current ID
+    })
 }
 
+// Function to get the next available stock item ID, allowing ID reuse
+fn get_next_item_id() -> u64 {
+    // Check if there are any reusable IDs in the ITEM_ID_COUNTER
+    if let Some(reused_id) = ITEM_ID_COUNTER.with(|counter| {
+        let mut counter = counter.borrow_mut();
+        if !counter.is_empty() {
+            return counter.pop(); // Return the last reusable ID
+        }
+        None // No reusable ID available
+    }) {
+        return reused_id; // Return the reused ID if available
+    }
+
+    // If no reusable IDs are available, increment the counter for new IDs starting from 1
+    ITEM_ID_INCREMENT.with(|counter| {
+        let mut id = counter.borrow_mut();
+        let next_id = *id;   // Get the current ID
+        *id += 1;            // Increment for next use
+        next_id              // Return the current ID
+    })
+}
 
 #[ic_cdk::query]
 fn get_warehouse(id: u64) -> Result<Warehouse, Error> {
@@ -110,10 +161,7 @@ fn get_warehouse(id: u64) -> Result<Warehouse, Error> {
 
 #[ic_cdk::update]
 fn add_warehouse(payload: WarehousePayload) -> Result<Warehouse, Error> {
-    let id = WAREHOUSE_ID_COUNTER.with(|c| {
-        let mut counter = c.borrow_mut(); // Keep everything within this closure
-        get_next_available_id(&mut counter) // Pass the mutable reference
-    });
+    let id = get_next_warehouse_id();  // Get the next available ID
 
     let warehouse = Warehouse {
         id,
@@ -130,42 +178,28 @@ fn add_warehouse(payload: WarehousePayload) -> Result<Warehouse, Error> {
 
 #[ic_cdk::update]
 fn delete_warehouse(warehouse_id: u64) -> Result<Warehouse, Error> {
-    WAREHOUSE_STORAGE.with(|warehouse_storage| {
-        let mut warehouse_store = warehouse_storage.borrow_mut();
-        
-        if let Some(warehouse) = warehouse_store.remove(&warehouse_id) {
-            // Remove items from STOCK_STORAGE
-            let items_to_delete: Vec<u64> = STOCK_STORAGE.with(|stock_storage| {
-                let  stock_store = stock_storage.borrow_mut();
+    // Attempt to remove the warehouse, minimizing the mutable borrow
+    let warehouse = WAREHOUSE_STORAGE.with(|warehouse_storage| {
+        // Create a mutable borrow
+        let mut storage = warehouse_storage.borrow_mut();
+        storage.remove(&warehouse_id) // Attempt to remove the warehouse
+    });
 
-                stock_store.iter()
-                    .filter_map(|(item_id, item)| {
-                        if item.warehouse_id == warehouse_id {
-                            Some(item_id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            });
-
-            for item_id in items_to_delete {
-                STOCK_STORAGE.with(|stock_storage| {
-                    let mut stock_store = stock_storage.borrow_mut();
-
-                    stock_store.remove(&item_id);
-                    ITEM_ID_COUNTER.with(|counter| counter.borrow_mut().push(item_id)); // Reuse the ID
-                });
-            }
-
-            Ok(warehouse)
-        } else {
-            Err(Error::NotFound {
-                msg: format!("Warehouse with id={} not found", warehouse_id),
-            })
-        }
-    })
+    // If a warehouse was found and removed, add its ID back to the reusable set
+    if let Some(warehouse) = warehouse {
+        // Borrow the ID counter and add the warehouse ID back
+        WAREHOUSE_ID_COUNTER.with(|counter| {
+            let mut counter_mut = counter.borrow_mut(); // Mutable borrow
+            counter_mut.insert(warehouse.id); // Add the deleted ID back
+        });
+        return Ok(warehouse);
+    } else {
+        return Err(Error::NotFound {
+            msg: format!("Warehouse with id={} not found", warehouse_id),
+        });
+    }
 }
+
 
 #[ic_cdk::query]
 fn get_all_warehouses_with_stocks() -> Vec<(Warehouse, Vec<StockItem>)> {
@@ -206,11 +240,8 @@ fn add_item_to_warehouse(payload: StockItemPayload) -> Result<StockItem, Error> 
         });
     }
 
-    // Get the next available item ID within the closure
-    let item_id = ITEM_ID_COUNTER.with(|c| {
-        let mut counter = c.borrow_mut();
-        get_next_available_id(&mut counter)
-    });
+    // Get the next available item ID
+    let item_id = get_next_item_id(); // Avoid nesting mutable borrows
 
     let item = StockItem {
         item_id,
@@ -221,14 +252,16 @@ fn add_item_to_warehouse(payload: StockItemPayload) -> Result<StockItem, Error> 
         updated_at: None,
     };
 
+    // Insert the new item outside of a nested borrow
     STOCK_STORAGE.with(|storage| {
-        storage.borrow_mut().insert(item_id, item.clone());
+        let mut stock_storage = storage.borrow_mut();
+        stock_storage.insert(item_id, item.clone());
     });
 
     Ok(item)
 }
 
-
+// Function to check stock
 #[ic_cdk::query]
 fn check_stock(item_id: u64) -> Result<StockItem, Error> {
     match STOCK_STORAGE.with(|storage| storage.borrow().get(&item_id)) {
@@ -243,7 +276,6 @@ fn check_stock(item_id: u64) -> Result<StockItem, Error> {
 fn delete_item(item_id: u64) -> Result<StockItem, Error> {
     STOCK_STORAGE.with(|storage| {
         let mut stock = storage.borrow_mut();
-
         
         if let Some(item) = stock.remove(&item_id) {
             ITEM_ID_COUNTER.with(|counter| counter.borrow_mut().push(item_id)); // Reuse the ID
@@ -256,8 +288,11 @@ fn delete_item(item_id: u64) -> Result<StockItem, Error> {
     })
 }
 
+
+// Function to transfer items between warehouses
 #[ic_cdk::update]
 fn transfer_item(item_id: u64, from_warehouse_id: u64, to_warehouse_id: u64, quantity: u64) -> Result<(), Error> {
+    // Scope for mutable borrow
     STOCK_STORAGE.with(|storage| {
         let mut stock = storage.borrow_mut();
         
@@ -289,10 +324,7 @@ fn transfer_item(item_id: u64, from_warehouse_id: u64, to_warehouse_id: u64, qua
 
             // Create a new item record for the destination warehouse
             let new_item = StockItem {
-                item_id: ITEM_ID_COUNTER.with(|c| {
-                    let mut counter = c.borrow_mut();
-                    get_next_available_id(&mut counter)
-                }),
+                item_id: get_next_item_id(),
                 warehouse_id: to_warehouse_id,
                 item_name: item.item_name.clone(),
                 quantity,
@@ -310,7 +342,6 @@ fn transfer_item(item_id: u64, from_warehouse_id: u64, to_warehouse_id: u64, qua
         }
     })
 }
-
 
 #[ic_cdk::query]
 fn get_warehouse_stock(warehouse_id: u64) -> Vec<StockItem> {
